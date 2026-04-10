@@ -50,19 +50,19 @@ CORS(app)   # allow browser fetch from any origin during dev
 
 # ── Global optimizer state (loaded once on startup) ──────────────────────────
 _STATE = {}
-from data_fetcher import load_data  # or whatever your function name is
+  from data_fetcher import load_data  # or whatever your function name is
 
-try:
-    data = load_data()
+  try:
+      data = load_data()
 
-    _STATE["funds"] = data["funds"]
-    _STATE["ann_returns"] = data["ann_returns"]
-    _STATE["cov_matrix"] = data["cov_matrix"]
+      _STATE["funds"] = data["funds"]
+      _STATE["ann_returns"] = data["ann_returns"]
+      _STATE["cov_matrix"] = data["cov_matrix"]
 
-    print("✅ Data loaded successfully")
+      print("✅ Data loaded successfully")
 
-except Exception as e:
-    print("❌ Data loading failed:", str(e))
+  except Exception as e:
+      print("❌ Data loading failed:", str(e))
 def _init_state():
     global _STATE
     logger.info("Initialising optimizer state...")
