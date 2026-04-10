@@ -214,20 +214,31 @@ input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.2); }
 <div class="app">
 
 <!-- HEADER -->
-<header>
-  <div class="logo">
-    <div class="logo-mark">FP</div>
-    <div>
-      <h1>Flexi-Cap Portfolio Optimizer</h1>
-      <div class="tagline">INDIAN EQUITY AMC · MARKOWITZ · NIFTY PE/PB VALUATION OVERLAY</div>
-    </div>
+<header style="flex-direction: column; align-items: flex-start; gap: 6px;">
+
+  <!-- CREATED BY (NEW LINE) -->
+  <div style="font-family: var(--mono); font-size: .65rem; color: var(--accent); letter-spacing: .08em;">
+    CREATED BY VISHAL SINGH
   </div>
-  <div class="pill-row">
-    <span class="pill" id="pill-funds">— FUNDS</span>
-    <span class="pill">VOL CAP 10%</span>
-    <span class="pill">RF 6.5%</span>
-    <span class="pill">EQUITY 50–90%</span>
-    <span class="pill" id="pill-source">LOADING…</span>
+
+  <div style="display: flex; align-items: flex-start; justify-content: space-between; width: 100%; flex-wrap: wrap; gap: 12px;">
+    
+    <div class="logo">
+      <div class="logo-mark">FP</div>
+      <div>
+        <h1>Flexi-Cap Portfolio Optimizer</h1>
+        <div class="tagline">INDIAN EQUITY AMC · MARKOWITZ · NIFTY PE/PB VALUATION OVERLAY</div>
+      </div>
+    </div>
+
+    <div class="pill-row">
+      <span class="pill" id="pill-funds">— FUNDS</span>
+      <span class="pill">VOL CAP 10%</span>
+      <span class="pill">RF 6.5%</span>
+      <span class="pill">EQUITY 50–90%</span>
+      <span class="pill" id="pill-source">LOADING…</span>
+    </div>
+
   </div>
 </header>
 
