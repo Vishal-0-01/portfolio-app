@@ -10,14 +10,14 @@ import time
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
-── Path setup ─────────────────────────────────────────────
+#── Path setup ─────────────────────────────────────────────
 
 BASE_DIR     = os.path.dirname(os.path.abspath(file))
 BACKEND_DIR  = os.path.join(BASE_DIR, "backend")
 FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 sys.path.insert(0, BACKEND_DIR)
 
-── Imports ────────────────────────────────────────────────
+#── Imports ────────────────────────────────────────────────
 
 from optimizer import (
 optimize_for_pe_pb, compute_frontier, run_backtest,
@@ -28,17 +28,17 @@ NIFTY_MEAN_PE, NIFTY_STD_PE, NIFTY_MEAN_PB, NIFTY_STD_PB,
 )
 from data_fetcher import get_returns
 
-── Logging ────────────────────────────────────────────────
+#── Logging ────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
-── Flask setup ────────────────────────────────────────────
+#── Flask setup ────────────────────────────────────────────
 
 app = Flask(name, static_folder=FRONTEND_DIR)
 CORS(app)
 
-── Global state ───────────────────────────────────────────
+#── Global state ───────────────────────────────────────────
 
 _STATE = {}
 
@@ -74,7 +74,7 @@ except Exception as e:
     logger.error("STATE INIT FAILED: %s", str(e))
     _STATE = {}  # prevent crash
 
-── Helpers ────────────────────────────────────────────────
+#── Helpers ────────────────────────────────────────────────
 
 def _ok(data):
 return jsonify({"status": "ok", "data": data})
@@ -82,7 +82,7 @@ return jsonify({"status": "ok", "data": data})
 def _err(msg, code=400):
 return jsonify({"status": "error", "message": msg}), code
 
-── Routes ────────────────────────────────────────────────
+#── Routes ────────────────────────────────────────────────
 
 @app.route("/health")
 def health():
@@ -156,7 +156,7 @@ return _ok({
 "nifty_std_pb": NIFTY_STD_PB,
 })
 
-── Frontend ───────────────────────────────────────────────
+#── Frontend ───────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -166,7 +166,6 @@ return send_from_directory(FRONTEND_DIR, "index.html")
 def static_files(path):
 return send_from_directory(FRONTEND_DIR, path)
 
-── Run ────────────────────────────────────────────────────
 
 if name == "main":
 _init_state()
