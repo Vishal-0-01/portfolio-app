@@ -1,23 +1,18 @@
 """
-app.py — Flask API Server (FIXED)
+app.py — FINAL CLEAN VERSION
 """
 
 import os
 import sys
 import logging
-import time
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
-#── Path setup ─────────────────────────────────────────────
-
-BASE_DIR     = os.path.dirname(os.path.abspath(file))
-BACKEND_DIR  = os.path.join(BASE_DIR, "backend")
+BASE_DIR = os.path.dirname(os.path.abspath(file))
+BACKEND_DIR = os.path.join(BASE_DIR, "backend")
 FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 sys.path.insert(0, BACKEND_DIR)
-
-#── Imports ────────────────────────────────────────────────
 
 from optimizer import (
 optimize_for_pe_pb, compute_frontier, run_backtest,
@@ -28,38 +23,31 @@ NIFTY_MEAN_PE, NIFTY_STD_PE, NIFTY_MEAN_PB, NIFTY_STD_PB,
 )
 from data_fetcher import get_returns
 
-#── Logging ────────────────────────────────────────────────
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
-#── Flask setup ────────────────────────────────────────────
-
 app = Flask(name, static_folder=FRONTEND_DIR)
 CORS(app)
-
-#── Global state ───────────────────────────────────────────
 
 _STATE = {}
 
 def _init_state():
 global _STATE
-logger.info("Initializing optimizer state...")
-
 try:
-    returns_df, source = get_returns()
+returns_df, source = get_returns()
 
     funds = list(returns_df.columns)
+
     ann_returns, cov_mat, vols, fund_sharpes = build_cov_from_returns(returns_df)
 
     state = get_optimizer_state(funds, ann_returns, cov_mat, vols, fund_sharpes)
 
     state["source"] = source
+    state["funds"] = funds
     state["ann_returns"] = ann_returns
     state["cov_mat"] = cov_mat
     state["vols"] = vols
     state["fund_sharpes"] = fund_sharpes
-    state["funds"] = funds
 
     state["frontier"] = compute_frontier(ann_returns, cov_mat)
     state["backtest"] = run_backtest(ann_returns, cov_mat, vols, fund_sharpes, funds)
@@ -68,21 +56,17 @@ try:
     )
 
     _STATE = state
-    logger.info("State initialized successfully")
+    logger.info("State initialized")
 
 except Exception as e:
     logger.error("STATE INIT FAILED: %s", str(e))
-    _STATE = {}  # prevent crash
-
-#── Helpers ────────────────────────────────────────────────
+    _STATE = {}
 
 def _ok(data):
 return jsonify({"status": "ok", "data": data})
 
 def _err(msg, code=400):
 return jsonify({"status": "error", "message": msg}), code
-
-#── Routes ────────────────────────────────────────────────
 
 @app.route("/health")
 def health():
@@ -156,8 +140,6 @@ return _ok({
 "nifty_std_pb": NIFTY_STD_PB,
 })
 
-#── Frontend ───────────────────────────────────────────────
-
 @app.route("/")
 def index():
 return send_from_directory(FRONTEND_DIR, "index.html")
@@ -165,7 +147,6 @@ return send_from_directory(FRONTEND_DIR, "index.html")
 @app.route("/"path:path" (path:path)")
 def static_files(path):
 return send_from_directory(FRONTEND_DIR, path)
-
 
 if name == "main":
 _init_state()
