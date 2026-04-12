@@ -25,15 +25,20 @@
 
 .creator-text {
   font-family: var(--sans);
-  font-weight: 900;
-  font-size: clamp(2rem, 4.5vw, 3.2rem);
-  letter-spacing: -0.02em;
+  font-weight: 800;
+  font-size: clamp(1.2rem, 2.2vw, 1.8rem);  /* ↓ much tighter */
+
+  letter-spacing: 0.04em;
 
   background: linear-gradient(135deg, var(--accent), var(--purple));
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
 
-  text-shadow: 0 0 30px rgba(0,229,255,0.35);
+  text-shadow: 0 0 12px rgba(0,229,255,0.25); /* ↓ less glow */
+}
+
+  .creator-banner {
+  margin-bottom: 4px;  /* ↓ reduce gap */
 }
 
 .creator-sub {
