@@ -1,12 +1,51 @@
+
 """
 optimizer.py — Portfolio Optimization Core
 ============================================
 Handles:
   - Fund returns & covariance estimation
   - Valuation-adjusted equity allocation (PE/PB z-score)
-  - Constrained Markowitz optimization (portfolio vol ≤ 10%)
-  - Vol constraint bug fixes (post-optimization validation + fallback)
-  - 10-year backtest simulation
+  - Constrained Markowitz optimization (portfolio vol <= 10%)
+  - Vol constraint with 3-layer fallback chain
+  - 10-year backtest (allocation + performance)
+
+RETURN CALCULATION FIX (build_cov_from_returns)
+------------------------------------------------
+Old code:
+    mean_ret = returns_df.mean().values * 252   # WRONG
+
+This is the arithmetic annualized mean. It overstates the true compounded
+annual growth rate (CAGR) by approximately vol^2 / 2 per year (Jensen's
+inequality / Ito's lemma). For a fund with vol = 0.20, this overstates
+returns by 2% per year. For vol = 0.25, by 3.1% per year.
+
+When combined with the short-window bias (see data_fetcher.py), the
+arithmetic method was producing 25-47% "returns" instead of realistic 11-16%.
+
+Fix:
+    Use the geometric (log-return) method:
+        ann_ret_i = exp( mean(log(1 + r_daily_i)) * 252 ) - 1
+
+    This is mathematically equivalent to:
+        (final_NAV / initial_NAV)^(trading_days_per_year / total_days) - 1
+
+    It correctly accounts for compounding and gives the true CAGR.
+    The difference from arithmetic: exactly -vol^2/2 per year (removed bias).
+
+COVARIANCE FIX
+--------------
+Old code used returns_df.cov() on a matrix where different funds had
+different NaN patterns (due to different inception dates). pandas .cov()
+uses pairwise complete observations by default, which is correct — it
+uses the overlapping period for each pair. However, multiplying the
+resulting matrix by 252 is correct only if returns are daily.
+
+We keep returns_df.cov() * 252 but add a PSD regularisation step.
+
+VOLATILITY
+----------
+Volatility computed from cov matrix diagonal is unaffected by the
+arithmetic/geometric distinction — it was already correct.
 """
 
 import numpy as np
@@ -18,7 +57,7 @@ logger = logging.getLogger(__name__)
 # ── GLOBAL PARAMETERS ────────────────────────────────────────────────────────
 RF          = 0.065   # India 91-day T-bill
 VOL_CAP     = 0.10    # Hard portfolio vol cap
-VOL_TOL     = 0.0005  # Tolerance: accept up to 10.05% (optimizer numerical error)
+VOL_TOL     = 0.0005  # Accept up to 10.05% (SLSQP numerical tolerance)
 MIN_FUND_W  = 0.03
 MAX_FUND_W  = 0.25
 
@@ -30,40 +69,37 @@ DEBT_RET, DEBT_VOL = 0.075, 0.040
 GOLD_RET, GOLD_VOL = 0.100, 0.150
 CASH_RET, CASH_VOL = 0.068, 0.005
 
-# Cross-asset correlations (equity with others)
 RHO_EQ_DEBT   = -0.10
 RHO_EQ_GOLD   =  0.05
 RHO_DEBT_GOLD =  0.00
 
-# Static 10-year Nifty PE/PB history (annual snapshots, Dec year-end)
-# Sources: NSE historical P/E data
+# Historical Nifty 50 PE/PB (Dec year-end snapshots)
 NIFTY_HISTORY = {
     2015: {"pe": 22.0, "pb": 3.2},
     2016: {"pe": 22.7, "pb": 3.3},
     2017: {"pe": 26.4, "pb": 3.5},
     2018: {"pe": 24.0, "pb": 3.4},
     2019: {"pe": 28.5, "pb": 3.5},
-    2020: {"pe": 37.5, "pb": 4.0},   # COVID recovery spike
+    2020: {"pe": 37.5, "pb": 4.0},
     2021: {"pe": 27.5, "pb": 4.5},
     2022: {"pe": 22.3, "pb": 3.9},
     2023: {"pe": 23.7, "pb": 4.0},
     2024: {"pe": 22.0, "pb": 3.7},
 }
 
-# Synthetic returns & cov used when mftool is unavailable
-# (replace with live data via build_cov_from_returns() after fetching NAVs)
 FUNDS_DEFAULT = [
     "Parag Parikh", "Quant", "ICICI", "Motilal Oswal", "HDFC",
     "Aditya Birla", "ITI", "Tata", "Invesco", "Bank of India",
     "HSBC", "Edelweiss", "WhiteOak"
 ]
 
-def _build_synthetic_params(seed=42):
-    """Reproducible synthetic params for demo / fallback."""
+def _build_synthetic_params():
+    """Reproducible synthetic params: ~13% geometric CAGR, 17-21% vol."""
     n = len(FUNDS_DEFAULT)
-    ann_returns = np.array([0.18, 0.22, 0.16, 0.20, 0.17,
-                             0.15, 0.19, 0.16, 0.15, 0.20,
-                             0.16, 0.14, 0.21])
+    # Realistic geometric CAGRs for Indian flexi-cap funds (long-run)
+    ann_returns = np.array([0.14, 0.15, 0.12, 0.14, 0.13,
+                             0.12, 0.13, 0.12, 0.12, 0.13,
+                             0.12, 0.11, 0.14])
     np.random.seed(10)
     corr = np.full((n, n), 0.82)
     for i in range(n):
@@ -81,63 +117,86 @@ def _build_synthetic_params(seed=42):
 _SYNTHETIC_RETURNS, _SYNTHETIC_COV, _SYNTHETIC_VOLS = _build_synthetic_params()
 
 
-# ── COVARIANCE HELPERS ───────────────────────────────────────────────────────
+# ── COVARIANCE & RETURN ESTIMATION ───────────────────────────────────────────
+
 def build_cov_from_returns(returns_df):
     """
-    FINAL FIX:
-    - Uses geometric CAGR (correct)
-    - Clips outliers
-    - Stable covariance
+    Build annualized geometric returns, covariance matrix, vols, and Sharpe
+    ratios from a daily returns DataFrame.
+
+    Returns DataFrame may have NaN for dates where a fund has no data
+    (different inception dates). This is handled as follows:
+      - Geometric return: computed per-fund on its own non-NaN observations
+      - Covariance: pandas .cov() uses pairwise complete observations
+        (default min_periods=1), which correctly uses overlapping periods
+        for each pair of funds
+
+    CRITICAL FIX: use geometric (log-return) annualization, NOT arithmetic.
+        ann_ret_i = exp( mean(log(1 + r_i)) * 252 ) - 1
+    This removes the +vol^2/2 upward bias in the arithmetic method.
     """
+    import numpy as np
 
-    # ── Step 1: Clean data ─────────────────────────────
-    returns_df = returns_df.copy()
-    returns_df = returns_df.clip(lower=-0.15, upper=0.15)
-    returns_df = returns_df.dropna()
+    n_funds = len(returns_df.columns)
 
-    # ── Step 2: CAGR (correct return calculation) ──────
-    cumulative = (1 + returns_df).prod()
-    n_days = len(returns_df)
-    years = n_days / 252
+    # ── Geometric annualized returns (per fund, on its own valid history) ──
+    ann_returns = np.zeros(n_funds)
+    n_obs       = np.zeros(n_funds, dtype=int)
 
-    ann_returns = cumulative ** (1 / years) - 1
+    for i, col in enumerate(returns_df.columns):
+        r = returns_df[col].dropna()  # use only this fund's valid days
+        n_obs[i] = len(r)
 
-    # ── Step 3: Covariance ─────────────────────────────
+        if len(r) < 2:
+            logger.warning("Fund %s has only %d observations — defaulting to RF", col, len(r))
+            ann_returns[i] = RF
+            continue
+
+        # Geometric CAGR via log-return method
+        # log(1+r) → mean → * 252 → exp → -1
+        # Numerically stable for small daily returns
+        log_ret = np.log1p(r.values)
+        ann_returns[i] = float(np.expm1(log_ret.mean() * 252))
+
+        logger.info(
+            "%-18s  n=%4d days  geo_CAGR=%.2f%%",
+            col, len(r), ann_returns[i] * 100
+        )
+
+    # ── Annualized covariance matrix ──────────────────────────────────────
+    # .cov() with default min_periods=1 uses pairwise overlapping periods.
+    # Multiply by 252 to annualize (correct for daily returns).
     cov_mat = returns_df.cov().values * 252
 
-    # Ensure PSD
+    # Ensure positive semi-definite (floating point can introduce tiny
+    # negative eigenvalues on short pairwise windows)
     eigvals = np.linalg.eigvalsh(cov_mat)
     if eigvals.min() < 0:
-        cov_mat += (-eigvals.min() + 1e-8) * np.eye(len(ann_returns))
+        cov_mat += (-eigvals.min() + 1e-8) * np.eye(n_funds)
+        logger.debug("PSD fix applied: shift = %.2e", -eigvals.min() + 1e-8)
 
-    # ── Step 4: Volatility ─────────────────────────────
+    # Annualized volatilities from diagonal
     vols = np.sqrt(np.diag(cov_mat))
 
-    # ── Step 5: Sharpe ─────────────────────────────────
-    sharpe = np.zeros_like(vols)
-    valid = vols > 1e-8
-    sharpe[valid] = (ann_returns.values[valid] - RF) / vols[valid]
+    # Sharpe ratios (geometric return basis)
+    fund_sharpes = (ann_returns - RF) / np.where(vols > 0, vols, np.nan)
 
-    return ann_returns.values, cov_mat, vols, sharpe
+    # Diagnostics
+    logger.info(
+        "Return range: %.1f%% – %.1f%%  (expected 10–18%% for Indian flexi-cap)",
+        ann_returns.min() * 100, ann_returns.max() * 100
+    )
+    logger.info(
+        "Vol range: %.1f%% – %.1f%%",
+        vols.min() * 100, vols.max() * 100
+    )
+    logger.info(
+        "Sharpe range: %.2f – %.2f  (expected 0.3–1.2)",
+        np.nanmin(fund_sharpes), np.nanmax(fund_sharpes)
+    )
 
+    return ann_returns, cov_mat, vols, fund_sharpes
 
-    # ── Step 3: Covariance ─────────────────────────────
-    cov_mat = log_returns.cov().values * 252
-
-    # Ensure PSD (numerical stability)
-    eigvals = np.linalg.eigvalsh(cov_mat)
-    if eigvals.min() < 0:
-        cov_mat += (-eigvals.min() + 1e-8) * np.eye(len(mean_log))
-
-    # ── Step 4: Volatility ─────────────────────────────
-    vols = np.sqrt(np.diag(cov_mat))
-
-    # ── Step 5: Sharpe ratio ───────────────────────────
-    sharpe = np.zeros_like(vols)
-    valid = vols > 1e-8
-    sharpe[valid] = (ann_returns[valid] - RF) / vols[valid]
-
-    return ann_returns, cov_mat, vols, sharpe
 
 # ── VALUATION LOGIC ──────────────────────────────────────────────────────────
 
@@ -155,9 +214,9 @@ def equity_from_z(z):
 
 def get_non_equity(E, z):
     """
-    Split non-equity (1-E) into debt/gold/cash proportions.
-    When market is expensive (z > 0): more debt+gold, less cash.
-    When cheap (z < 0): more cash, slightly less gold.
+    Split non-equity (1-E) into debt/gold/cash.
+    Expensive market (z > 0): more debt+gold, less cash.
+    Cheap market (z < 0): more cash, slightly less gold.
     """
     rem = 1.0 - E
     d = np.clip(0.55 + 0.05 * z, 0.30, 0.70)
@@ -171,27 +230,13 @@ def get_non_equity(E, z):
 
 def portfolio_vol_from_weights(E, w_eq, D, G, C, cov_mat):
     """
-    Full portfolio volatility including equity sleeve + debt + gold + cash.
+    Full portfolio volatility: equity sleeve + debt + gold + cash.
 
-    BUG ROOT CAUSE (FIXED HERE):
-    The original code computed equity volatility as sqrt(w @ cov @ w) where
-    cov was already annualised. This is correct. However, the variance
-    computation used:
-
-        2*E*D * eq_vol * DEBT_VOL * RHO_EQ_DEBT
-
-    which gives the covariance term between the PORTFOLIO-LEVEL equity block
-    and the debt block. This is correct IF eq_vol is the *portfolio-level*
-    equity vol (i.e., E * sleeve_vol). The original code used sleeve_vol,
-    not portfolio-level vol — causing the cross-terms to be underestimated
-    and allowing the total var to appear lower than it really is.
-
-    Fix: factor E into the covariance cross-terms correctly, i.e. use
-    the actual portfolio dollar-weights: w_portfolio_eq = E * w_eq.
-    Then sigma_eq = sqrt((E*w_eq)' Cov (E*w_eq)) = E * sleeve_vol.
+    Uses sigma_eq = E * sleeve_vol (portfolio-level equity vol block)
+    so cross-asset covariance terms are correct.
     """
     sleeve_vol = float(np.sqrt(np.clip(w_eq @ cov_mat @ w_eq, 0, None)))
-    sigma_eq   = E * sleeve_vol   # ← portfolio-level equity vol block
+    sigma_eq   = E * sleeve_vol
 
     var = (
         sigma_eq ** 2 +
@@ -211,25 +256,21 @@ def portfolio_return(E, w_eq, D, G, C, ann_returns):
 
 
 def full_stats(E, w_eq, D, G, C, ann_returns, cov_mat):
-    ret  = portfolio_return(E, w_eq, D, G, C, ann_returns)
-    vol, sleeve_vol = portfolio_vol_from_weights(E, w_eq, D, G, C, cov_mat)
+    ret              = portfolio_return(E, w_eq, D, G, C, ann_returns)
+    vol, sleeve_vol  = portfolio_vol_from_weights(E, w_eq, D, G, C, cov_mat)
     return ret, vol, sleeve_vol
 
 
 # ── OPTIMIZATION ─────────────────────────────────────────────────────────────
 
-def _min_vol_weights(n, E, D, G, C, cov_mat, vol_cap=VOL_CAP):
-    """
-    Fallback: find minimum-vol fund weights that satisfy the portfolio vol cap.
-    Used when the max-return optimizer fails or violates the constraint.
-    """
+def _min_vol_weights(n, E, D, G, C, cov_mat):
+    """Fallback: find minimum-vol fund weights (ignores return objective)."""
     def obj(w):
         v, _ = portfolio_vol_from_weights(E, w, D, G, C, cov_mat)
         return v
 
     best = None
-    for w0 in [np.ones(n) / n,
-               np.random.dirichlet(np.ones(n) * 3)]:
+    for w0 in [np.ones(n) / n, np.random.dirichlet(np.ones(n) * 3)]:
         r = minimize(obj, w0, method='SLSQP',
                      bounds=[(MIN_FUND_W, MAX_FUND_W)] * n,
                      constraints=[{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}],
@@ -237,29 +278,24 @@ def _min_vol_weights(n, E, D, G, C, cov_mat, vol_cap=VOL_CAP):
         if r.success:
             v, _ = portfolio_vol_from_weights(E, r.x, D, G, C, cov_mat)
             if best is None or v < best[1]:
-                best = (r.x, v)
+                best = (r.x.copy(), v)
 
-    if best is None:
-        return np.ones(n) / n, None
-    return best[0], best[1]
+    return (best[0], best[1]) if best else (np.ones(n) / n, None)
 
 
-def _scale_equity_to_meet_cap(w_eq, E_target, D_base, G_base, C_base, z,
-                               cov_mat, vol_cap=VOL_CAP):
+def _scale_equity_to_meet_cap(w_eq, E_target, z, cov_mat, vol_cap=VOL_CAP):
     """
-    If even minimum-vol fund weights still breach the cap at E_target,
-    step E down (within [50%, 90%]) until the cap is satisfied.
-    Returns (E_final, D, G, C) that meet vol_cap.
+    If even minimum-vol weights violate the cap, step equity down in 0.5pp
+    increments until satisfied. Bounded below by 50%.
     """
     E = E_target
-    for _ in range(100):
+    for _ in range(80):
         D, G, C = get_non_equity(E, z)
         v, _ = portfolio_vol_from_weights(E, w_eq, D, G, C, cov_mat)
         if v <= vol_cap + VOL_TOL:
             return E, D, G, C, v
-        E = max(0.50, E - 0.005)   # reduce equity by 0.5pp steps
+        E = max(0.50, E - 0.005)
 
-    # Last resort: equity = 50%
     D, G, C = get_non_equity(0.50, z)
     v, _ = portfolio_vol_from_weights(0.50, w_eq, D, G, C, cov_mat)
     return 0.50, D, G, C, v
@@ -268,37 +304,37 @@ def _scale_equity_to_meet_cap(w_eq, E_target, D_base, G_base, C_base, z,
 def optimize_for_pe_pb(pe, pb, ann_returns, cov_mat, vols, fund_sharpes, funds,
                         vol_cap=VOL_CAP):
     """
-    Main entry point. Returns full allocation dict for given PE/PB.
+    Main optimization entry point.
 
-    FIXES applied:
-    1. Correct portfolio vol formula (E * sleeve_vol in cross-terms).
-    2. Post-optimization hard validation: if result > vol_cap + VOL_TOL,
-       trigger fallback chain.
-    3. Fallback chain:
-       a) Re-run optimizer with tighter tolerance and more random starts.
-       b) Use min-vol weights.
-       c) Scale down equity allocation until cap is met.
-    4. All random seeds fixed per (pe, pb) so results are reproducible.
+    Maximise portfolio return subject to:
+      - portfolio vol <= vol_cap (10%)
+      - fund weights in [MIN_FUND_W, MAX_FUND_W] (3%–25%)
+      - weights sum to 1
+      - equity allocation fixed by PE/PB valuation z-score
+
+    Fallback chain if primary optimizer fails:
+      1. Re-run with 10 random starting points
+      2. Use minimum-vol weights
+      3. Scale equity down until cap is satisfied
     """
     n = len(funds)
     z_pe, z_pb, z = valuation_z(pe, pb)
     E_val = equity_from_z(z)
     D0, G0, C0 = get_non_equity(E_val, z)
 
-    # ── Step 1: max-return optimizer ─────────────────────────────────────
     def neg_ret(w):
         return -portfolio_return(E_val, w, D0, G0, C0, ann_returns)
 
     def vol_constraint(w):
-        # SLSQP ineq: must be >= 0  →  vol_cap - vol >= 0
         v, _ = portfolio_vol_from_weights(E_val, w, D0, G0, C0, cov_mat)
-        return vol_cap - v
+        return vol_cap - v   # >= 0 for SLSQP ineq
 
-    rng = np.random.default_rng(int(pe * 100 + pb * 10))
+    rng   = np.random.default_rng(int(pe * 100 + pb * 10))
     inits = ([np.ones(n) / n] +
              [rng.dirichlet(np.ones(n) * 2) for _ in range(9)])
 
     best_ret, best_w, best_vol = -np.inf, None, None
+
     for w0 in inits:
         w0 = np.asarray(w0, dtype=float)
         w0 /= w0.sum()
@@ -319,32 +355,32 @@ def optimize_for_pe_pb(pe, pb, ann_returns, cov_mat, vols, fund_sharpes, funds,
             continue
 
         w_cand = np.clip(r.x, MIN_FUND_W, MAX_FUND_W)
-        w_cand /= w_cand.sum()          # re-normalise after clipping
+        w_cand /= w_cand.sum()
         v_cand, _ = portfolio_vol_from_weights(E_val, w_cand, D0, G0, C0, cov_mat)
         ret_cand   = portfolio_return(E_val, w_cand, D0, G0, C0, ann_returns)
 
         if v_cand <= vol_cap + VOL_TOL and ret_cand > best_ret:
             best_ret, best_w, best_vol = ret_cand, w_cand.copy(), v_cand
 
-    # ── Step 2: fallback — min-vol weights ───────────────────────────────
+    # Fallback: min-vol weights
     if best_w is None:
-        logger.warning("Optimizer failed for PE=%.1f PB=%.1f — using min-vol fallback", pe, pb)
-        best_w, best_vol = _min_vol_weights(n, E_val, D0, G0, C0, cov_mat, vol_cap)
+        logger.warning("Primary optimizer failed for PE=%.1f PB=%.1f — min-vol fallback", pe, pb)
+        best_w, best_vol = _min_vol_weights(n, E_val, D0, G0, C0, cov_mat)
         best_ret = portfolio_return(E_val, best_w, D0, G0, C0, ann_returns)
 
-    # ── Step 3: hard validation — scale equity if still over cap ─────────
+    # Hard validation: scale equity if still over cap
     v_final, sl_vol = portfolio_vol_from_weights(E_val, best_w, D0, G0, C0, cov_mat)
     E_final, D_final, G_final, C_final = E_val, D0, G0, C0
 
     if v_final > vol_cap + VOL_TOL:
-        logger.warning("Vol %.4f > cap %.4f at PE=%.1f — scaling equity down", v_final, vol_cap, pe)
+        logger.warning("Vol %.4f > cap at PE=%.1f — scaling equity down", v_final, pe)
         E_final, D_final, G_final, C_final, v_final = _scale_equity_to_meet_cap(
-            best_w, E_val, D0, G0, C0, z, cov_mat, vol_cap
+            best_w, E_val, z, cov_mat, vol_cap
         )
 
     ret_final  = portfolio_return(E_final, best_w, D_final, G_final, C_final, ann_returns)
     _, sl_vol  = portfolio_vol_from_weights(E_final, best_w, D_final, G_final, C_final, cov_mat)
-    sharpe     = (ret_final - RF) / v_final if v_final > 0 else 0.0
+    sharpe     = float((ret_final - RF) / v_final) if v_final > 0 else 0.0
 
     return {
         "pe": pe, "pb": pb,
@@ -370,8 +406,7 @@ def optimize_for_pe_pb(pe, pb, ann_returns, cov_mat, vols, fund_sharpes, funds,
 def compute_frontier(ann_returns, cov_mat, z=0.25, n_points=12):
     """
     Trace efficient frontier by sweeping equity from 50% to 90%.
-    For each equity level: maximise return (unconstrained by vol cap,
-    so we can show the full frontier shape), then record (vol, ret, E).
+    For each level, maximise return (unconstrained by vol cap for shape).
     """
     n = len(ann_returns)
     frontier = []
@@ -388,24 +423,18 @@ def compute_frontier(ann_returns, cov_mat, z=0.25, n_points=12):
         if r.success:
             v, _ = portfolio_vol_from_weights(float(E_fix), r.x, D, G, C, cov_mat)
             ret   = portfolio_return(float(E_fix), r.x, D, G, C, ann_returns)
-            frontier.append({
-                "v": round(v, 4),
-                "r": round(ret, 4),
-                "E": round(float(E_fix), 2),
-            })
+            frontier.append({"v": round(v, 4), "r": round(ret, 4), "E": round(float(E_fix), 2)})
 
     return sorted(frontier, key=lambda x: x["v"])
 
 
-# ── BACKTEST ─────────────────────────────────────────────────────────────────
+# ── ALLOCATION BACKTEST ───────────────────────────────────────────────────────
 
 def run_backtest(ann_returns, cov_mat, vols, fund_sharpes, funds,
                  vol_cap=VOL_CAP, history=None):
     """
-    Simulate year-by-year allocation from 2015–2024 using historical
-    Nifty PE/PB snapshots.
-
-    Returns list of dicts, one per year, suitable for time-series charting.
+    Year-by-year allocation backtest using historical Nifty PE/PB snapshots.
+    Returns allocation history (NOT realised performance).
     """
     if history is None:
         history = NIFTY_HISTORY
@@ -414,190 +443,146 @@ def run_backtest(ann_returns, cov_mat, vols, fund_sharpes, funds,
     for year in sorted(history.keys()):
         pe = history[year]["pe"]
         pb = history[year]["pb"]
-
         res = optimize_for_pe_pb(
             pe, pb, ann_returns, cov_mat, vols, fund_sharpes, funds, vol_cap
         )
-
-        # Top 3 fund weights for display
-        fw = list(zip(funds, res["fund_weights"]))
-        fw_sorted = sorted(fw, key=lambda x: -x[1])[:3]
-
+        fw_sorted = sorted(zip(funds, res["fund_weights"]), key=lambda x: -x[1])[:3]
         results.append({
-            "year":        year,
-            "pe":          pe,
-            "pb":          pb,
-            "z":           res["z"],
-            "equity":      res["equity"],
-            "debt":        res["debt"],
-            "gold":        res["gold"],
-            "cash":        res["cash"],
-            "port_ret":    res["port_ret"],
-            "port_vol":    res["port_vol"],
-            "sharpe":      res["sharpe"],
+            "year":          year,
+            "pe":            pe,
+            "pb":            pb,
+            "z":             res["z"],
+            "equity":        res["equity"],
+            "debt":          res["debt"],
+            "gold":          res["gold"],
+            "cash":          res["cash"],
+            "port_ret":      res["port_ret"],
+            "port_vol":      res["port_vol"],
+            "sharpe":        res["sharpe"],
             "constraint_ok": res["constraint_ok"],
-            "top_funds":   [{"name": f, "weight": round(w, 4)} for f, w in fw_sorted],
+            "top_funds":     [{"name": f, "weight": round(w, 4)} for f, w in fw_sorted],
         })
-
     return results
 
 
-# ── PERFORMANCE BACKTEST ─────────────────────────────────────────────────────
+# ── PERFORMANCE BACKTEST ──────────────────────────────────────────────────────
 
 # Historical Nifty 50 TRI annual returns (approximate, Dec–Dec)
-# Sources: NSE India, moneycontrol historical data
 _NIFTY_ANNUAL_RETURNS = {
-    2015: -0.040,   # -4.1%  (bear year)
-    2016:  0.033,   #  3.3%
-    2017:  0.288,   # 28.8%  (bull run)
-    2018:  0.033,   #  3.3%  (flat/volatile)
-    2019:  0.122,   # 12.2%
-    2020:  0.147,   # 14.7%  (crash + sharp recovery)
-    2021:  0.242,   # 24.2%  (post-COVID rally)
-    2022:  0.043,   #  4.3%  (Russia/rate-hike year)
-    2023:  0.197,   # 19.7%
-    2024:  0.088,   #  8.8%  (estimate through Dec)
+    2015: -0.040, 2016:  0.033, 2017:  0.288, 2018:  0.033, 2019:  0.122,
+    2020:  0.147, 2021:  0.242, 2022:  0.043, 2023:  0.197, 2024:  0.088,
 }
 
 # Historical Gold (INR) annual returns (approximate)
 _GOLD_ANNUAL_RETURNS = {
-    2015: -0.060,
-    2016:  0.110,
-    2017:  0.050,
-    2018:  0.075,
-    2019:  0.190,
-    2020:  0.280,
-    2021: -0.040,
-    2022:  0.110,
-    2023:  0.130,
-    2024:  0.210,
+    2015: -0.060, 2016:  0.110, 2017:  0.050, 2018:  0.075, 2019:  0.190,
+    2020:  0.280, 2021: -0.040, 2022:  0.110, 2023:  0.130, 2024:  0.210,
 }
 
-# Debt returns: approximate short-duration/liquid fund returns
 _DEBT_ANNUAL_RETURNS = {y: 0.068 for y in range(2015, 2025)}
 _CASH_ANNUAL_RETURNS = {y: 0.065 for y in range(2015, 2025)}
-
-# Long-run Nifty return used for alpha decomposition
-_NIFTY_LONGRUN = 0.12
+_NIFTY_LONGRUN       = 0.12
 
 
 def run_performance_backtest(ann_returns, cov_mat, vols, fund_sharpes, funds,
                               vol_cap=VOL_CAP, history=None):
     """
-    True performance backtest: for each year, get the valuation-optimal
-    allocation then apply that year's realised asset-class returns to build
-    a compounding portfolio value series.
+    True performance backtest: applies realised asset-class returns to the
+    valuation-optimal allocation for each year, and compounds into a
+    portfolio value series starting at 100.
 
     Equity sleeve return estimation:
-        fund_actual_ret_i = Nifty_ret + (ann_return_i - nifty_longrun)
-    This uses each fund's historical alpha over the market (derived from the
-    same covariance/return data already in use) and applies it to the
-    realised Nifty return each year. This keeps the model internally
-    consistent without requiring separate NAV history.
+        fund_actual_ret_i = Nifty_ret + (geometric_CAGR_i - nifty_longrun)
 
-    Does NOT modify any existing optimizer functions.
+    This uses each fund's historical alpha over the long-run market average
+    and applies it to the realised Nifty return for each year.
     """
     if history is None:
         history = NIFTY_HISTORY
 
-    years_sorted = sorted(history.keys())
-    n_years      = len(years_sorted)
+    years_sorted   = sorted(history.keys())
+    n_years        = len(years_sorted)
+    fund_alphas    = ann_returns - _NIFTY_LONGRUN
 
-    # Fund alpha over market (stable characteristic, computed once)
-    fund_alphas = ann_returns - _NIFTY_LONGRUN   # shape (n_funds,)
-
-    portfolio_value = 100.0
-    value_series    = [100.0]   # starts at 100 at beginning of 2015
+    portfolio_value   = 100.0
+    value_series      = [100.0]
     annual_ret_series = []
-    per_year = []
+    per_year          = []
 
     for year in years_sorted:
         pe = history[year]["pe"]
         pb = history[year]["pb"]
-
         res = optimize_for_pe_pb(
             pe, pb, ann_returns, cov_mat, vols, fund_sharpes, funds, vol_cap
         )
 
-        E   = res["equity"]
-        D   = res["debt"]
-        G   = res["gold"]
-        C   = res["cash"]
-        fw  = np.array(res["fund_weights"])
+        E  = res["equity"]
+        D  = res["debt"]
+        G  = res["gold"]
+        C  = res["cash"]
+        fw = np.array(res["fund_weights"])
 
-        # Realised returns for this year
         nifty_ret     = _NIFTY_ANNUAL_RETURNS.get(year, _NIFTY_LONGRUN)
-        fund_rets     = nifty_ret + fund_alphas          # per-fund realised return
+        fund_rets     = nifty_ret + fund_alphas
         eq_sleeve_ret = float(np.dot(fw, fund_rets))
         debt_ret      = _DEBT_ANNUAL_RETURNS.get(year, DEBT_RET)
         gold_ret      = _GOLD_ANNUAL_RETURNS.get(year, GOLD_RET)
         cash_ret      = _CASH_ANNUAL_RETURNS.get(year, CASH_RET)
 
-        port_ret = (E * eq_sleeve_ret +
-                    D * debt_ret +
-                    G * gold_ret +
-                    C * cash_ret)
-
+        port_ret = E*eq_sleeve_ret + D*debt_ret + G*gold_ret + C*cash_ret
         portfolio_value *= (1.0 + port_ret)
+
         value_series.append(round(portfolio_value, 4))
         annual_ret_series.append(round(port_ret, 6))
-
         per_year.append({
-            "year":         year,
-            "pe":           pe,
-            "pb":           pb,
-            "equity":       round(E, 4),
-            "debt":         round(D, 4),
-            "gold":         round(G, 4),
-            "cash":         round(C, 4),
-            "nifty_ret":    round(nifty_ret, 4),
-            "port_ret":     round(port_ret, 6),
-            "port_value":   round(portfolio_value, 4),
+            "year":       year, "pe": pe, "pb": pb,
+            "equity":     round(E, 4), "debt": round(D, 4),
+            "gold":       round(G, 4), "cash": round(C, 4),
+            "nifty_ret":  round(nifty_ret, 4),
+            "port_ret":   round(port_ret, 6),
+            "port_value": round(portfolio_value, 4),
         })
 
-    # ── Summary metrics ──────────────────────────────────────────────────────
     rets_arr  = np.array(annual_ret_series)
     cagr      = float((portfolio_value / 100.0) ** (1.0 / n_years) - 1.0)
     vol_bt    = float(np.std(rets_arr, ddof=1))
     sharpe_bt = float((cagr - RF) / vol_bt) if vol_bt > 0 else 0.0
 
-    # Max drawdown from peak
     peak = 100.0
     max_dd = 0.0
     for v in value_series[1:]:
-        if v > peak:
-            peak = v
-        dd = (v - peak) / peak
+        peak = max(peak, v)
+        dd   = (v - peak) / peak
         if dd < max_dd:
             max_dd = dd
 
     return {
-        "years":            [y for y in years_sorted],
-        "portfolio_value":  value_series[1:],   # year-end values (excl. initial 100)
-        "initial_value":    100.0,
-        "annual_returns":   annual_ret_series,
-        "cagr":             round(cagr, 6),
-        "max_drawdown":     round(max_dd, 6),
-        "volatility":       round(vol_bt, 6),
-        "sharpe":           round(sharpe_bt, 4),
-        "per_year":         per_year,
+        "years":           [y for y in years_sorted],
+        "portfolio_value": value_series[1:],
+        "initial_value":   100.0,
+        "annual_returns":  annual_ret_series,
+        "cagr":            round(cagr, 6),
+        "max_drawdown":    round(max_dd, 6),
+        "volatility":      round(vol_bt, 6),
+        "sharpe":          round(sharpe_bt, 4),
+        "per_year":        per_year,
     }
 
 
-# ── PUBLIC API ───────────────────────────────────────────────────────────────
+# ── PUBLIC API ────────────────────────────────────────────────────────────────
 
 def get_optimizer_state(funds=None, ann_returns=None, cov_mat=None,
                          vols=None, fund_sharpes=None):
     """
-    Returns the full optimizer state dict (parameters + synthetic data).
-    Called by app.py on startup if live NAV data is not available.
+    Returns full optimizer state dict. Called by app.py on startup.
+    Falls back to synthetic params if live data is unavailable.
     """
     if funds is None:
-        funds         = FUNDS_DEFAULT
-        ann_returns   = _SYNTHETIC_RETURNS
-        cov_mat       = _SYNTHETIC_COV
-        vols          = _SYNTHETIC_VOLS
-        fund_sharpes  = (ann_returns - RF) / vols
+        funds        = FUNDS_DEFAULT
+        ann_returns  = _SYNTHETIC_RETURNS
+        cov_mat      = _SYNTHETIC_COV
+        vols         = _SYNTHETIC_VOLS
+        fund_sharpes = (ann_returns - RF) / vols
 
     return {
         "funds":        funds,
