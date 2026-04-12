@@ -82,33 +82,44 @@ _SYNTHETIC_RETURNS, _SYNTHETIC_COV, _SYNTHETIC_VOLS = _build_synthetic_params()
 
 
 # ── COVARIANCE HELPERS ───────────────────────────────────────────────────────
-
 def build_cov_from_returns(returns_df):
     """
-    Build annualized mean returns, covariance matrix, vols, and Sharpe ratios
-    from a daily returns DataFrame.
-
-    FIXED:
-    - Uses log returns (more stable than simple mean)
-    - Clips extreme daily returns (removes spikes)
-    - Improves covariance stability
+    FINAL FIX:
+    - Uses geometric CAGR (correct)
+    - Clips outliers
+    - Stable covariance
     """
 
     # ── Step 1: Clean data ─────────────────────────────
     returns_df = returns_df.copy()
-
-    # Remove extreme outliers (bad NAV jumps / bad data)
-    returns_df = returns_df.clip(lower=-0.20, upper=0.20)
-
-    # Drop any remaining NaNs
+    returns_df = returns_df.clip(lower=-0.15, upper=0.15)
     returns_df = returns_df.dropna()
 
-    # ── Step 2: Log returns for stability ──────────────
-    log_returns = np.log1p(returns_df)
+    # ── Step 2: CAGR (correct return calculation) ──────
+    cumulative = (1 + returns_df).prod()
+    n_days = len(returns_df)
+    years = n_days / 252
 
-    # Annualized return (log → exp)
-    mean_log = log_returns.mean().values
-    ann_returns = np.exp(mean_log * 252) - 1
+    ann_returns = cumulative ** (1 / years) - 1
+
+    # ── Step 3: Covariance ─────────────────────────────
+    cov_mat = returns_df.cov().values * 252
+
+    # Ensure PSD
+    eigvals = np.linalg.eigvalsh(cov_mat)
+    if eigvals.min() < 0:
+        cov_mat += (-eigvals.min() + 1e-8) * np.eye(len(ann_returns))
+
+    # ── Step 4: Volatility ─────────────────────────────
+    vols = np.sqrt(np.diag(cov_mat))
+
+    # ── Step 5: Sharpe ─────────────────────────────────
+    sharpe = np.zeros_like(vols)
+    valid = vols > 1e-8
+    sharpe[valid] = (ann_returns.values[valid] - RF) / vols[valid]
+
+    return ann_returns.values, cov_mat, vols, sharpe
+
 
     # ── Step 3: Covariance ─────────────────────────────
     cov_mat = log_returns.cov().values * 252
