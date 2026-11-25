@@ -42,8 +42,8 @@ logger = logging.getLogger(__name__)
 SELECTED_SCHEMES = {
     "Parag Parikh":  "122639",
     "Quant":         "120843",
-    "ICICI":         "134799",
-    "Kotak":         "145552",
+    "ICICI":         "148990",
+    "Kotak":         "120166",
     "Motilal Oswal": "129046",
     "HDFC":          "118955",
     "Aditya Birla":  "120564",
